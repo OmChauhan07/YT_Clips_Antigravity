@@ -137,7 +137,8 @@ def get_channel_name(youtube_url: str) -> str:
         name = res.stdout.strip()
         if name:
             clean = re.sub(r"[^a-zA-Z0-9_\-\.\s]", "", name).strip()
-            return f"@{clean}" if not clean.startswith("@") else clean
+            handle = f"@{clean}" if not clean.startswith("@") else clean
+            return f"Source: {handle}"
     except Exception as e:
         print(f"    [Watermark] Notice: Could not fetch channel name ({e}).")
     return ""
@@ -258,10 +259,15 @@ def find_viral_clips(youtube_url: str, num_clips: int, model_name: str = "gemini
             break
 
     if len(selected_ts) < num_clips:
-        default_secs = [9340.0, 30435.0, 33340.0]
-        for ds in default_secs:
-            if not any(abs(ds - time_to_seconds(s["timestamp"])) < 120 for s in selected_ts):
-                selected_ts.append({"comment": "Viral stream highlight", "timestamp": seconds_to_hms(ds), "likes": 5})
+        step = (duration / (num_clips + 1)) if duration > 0 else 3600.0
+        for i in range(1, num_clips + 5):
+            anchor = i * step
+            if anchor < duration - 60 and not any(abs(anchor - time_to_seconds(s["timestamp"])) < 180 for s in selected_ts):
+                selected_ts.append({
+                    "comment": f"Peak hype stream moment around hour {int(anchor // 3600)}",
+                    "timestamp": seconds_to_hms(anchor),
+                    "likes": 10
+                })
             if len(selected_ts) >= num_clips:
                 break
 
@@ -369,8 +375,8 @@ def download_slice(youtube_url: str, start_sec: float, end_sec: float, out_path:
     subprocess.run(cmd, check=True)
 
 
-def generate_ass_subtitles(words: list[dict], punchline: str, ass_path: Path, duration_sec: float):
-    header = """[Script Info]
+def generate_ass_subtitles(words: list[dict], punchline: str, ass_path: Path, duration_sec: float, accent_bgr: str = "&H0000FFFF&"):
+    header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
@@ -378,8 +384,8 @@ WrapStyle: 1
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Punchline,Arial Black,48,&H0000FFFF,&H00FFFFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,0,0,1,5,2,8,50,50,220,1
-Style: Default,Arial Black,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,360,1
+Style: Punchline,Arial Black,48,{accent_bgr},&H00FFFFFF,&H00000000,&HA0000000,-1,0,0,0,100,100,0,0,1,5,2,8,50,50,220,1
+Style: Default,Arial Black,72,&H00FFFFFF,{accent_bgr},&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,5,2,2,60,60,360,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -398,7 +404,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         styled_parts = []
         for w in chunk:
             word_text = w["word"].strip().upper()
-            styled_parts.append(f"{{\\c&H0000FFFF&}}{word_text}{{\\c&H00FFFFFF&}}")
+            styled_parts.append(f"{{\\c{accent_bgr}}}{word_text}{{\\c&H00FFFFFF&}}")
         text_line = " ".join(styled_parts)
         lines.append(f"Dialogue: 0,{chunk_start},{chunk_end},Default,,0,0,0,,{text_line}")
 
@@ -579,25 +585,61 @@ def main():
     parser.add_argument("--local-cleanup", action="store_true", default=cfg.get("local_cleanup", True), help="Clean temp_work after processing")
     parser.add_argument("--save-config", action="store_true", help="Save specified clip count and layout as new default in config.json")
     parser.add_argument("--no-nsfw-scan", action="store_true", help="Skip vision-based NSFW censorship scan")
+    parser.add_argument("--out-dir", default=None, help="Output folder for clips")
+    parser.add_argument("--accent-color", default=None, help="ASS hex BGR color for punchline and subtitles (e.g. &H00008CFF&)")
+    parser.add_argument("--auto-clips", action="store_true", help="Calculate clips = round(duration in hours)")
     args = parser.parse_args()
 
     if args.save_config:
         save_config_defaults(args.clips, args.layout, args.facecam)
-
-    out_dir = Path("output_clips")
-    work_dir = Path("temp_work")
-    out_dir.mkdir(exist_ok=True)
-    work_dir.mkdir(exist_ok=True)
-
-    print(f"[Setup] Target clips: {args.clips} | Layout: {args.layout.upper()} | Facecam: {args.facecam}")
-    print(f"[Setup] High-Bitrate: 1080x1920 (CRF {cfg.get('crf', 17)}, Preset {cfg.get('preset', 'slow')})")
 
     # Fetch channel name for watermark
     watermark = get_channel_name(args.url)
     if watermark:
         print(f"[Setup] Watermark detected: {watermark}")
 
-    segments = find_viral_clips(args.url, args.clips, model_name=args.model)
+    # Determine dedicated output directory per source
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    else:
+        raw_name = watermark.replace("Source:", "").replace("@", "").strip()
+        folder_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", raw_name).strip("_")
+        out_dir = Path(f"output_clips/{folder_name or 'general'}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = Path("temp_work")
+    work_dir.mkdir(exist_ok=True)
+
+    # Determine accent color per source
+    STREAM_COLORS = {
+        "kai cenat": "&H00008CFF&",   # Neon Orange
+        "lacy": "&H0000FFFF&",        # Electric Yellow
+        "mythpat": "&H00FFFF00&",     # Bright Cyan / Blue
+        "sirloin": "&H0032CD32&",     # Lime Green
+        "shirrako": "&H00D800FF&",    # Hot Pink
+    }
+    accent = args.accent_color
+    if not accent and watermark:
+        low_wm = watermark.lower()
+        for k, v in STREAM_COLORS.items():
+            if k in low_wm:
+                accent = v
+                break
+    if not accent:
+        accent = "&H0000FFFF&"
+
+    # Auto-calculate clips = round(hours) if requested
+    if args.auto_clips or args.clips <= 0:
+        v_info = get_video_info(args.url)
+        dur = v_info.get("duration", 0)
+        target_clips = max(1, round(dur / 3600.0))
+        print(f"[Setup] Auto-calculated clips from duration ({dur}s / {dur/3600:.1f} hrs): {target_clips} clips.")
+    else:
+        target_clips = args.clips
+
+    print(f"[Setup] Target clips: {target_clips} | Layout: {args.layout.upper()} | Output: {out_dir.resolve()} | Accent: {accent}")
+    print(f"[Setup] High-Bitrate: 1080x1920 (CRF {cfg.get('crf', 17)}, Preset {cfg.get('preset', 'slow')})")
+
+    segments = find_viral_clips(args.url, target_clips, model_name=args.model)
     print(f"    Identified {len(segments)} viral moments.")
 
     print(f"[2/4] Loading Whisper model ({args.whisper_model})...")
@@ -629,7 +671,7 @@ def main():
                 for w in t_seg.words:
                     words.append({"word": w.word, "start": w.start, "end": w.end})
 
-        generate_ass_subtitles(words, seg.punchline, ass_path, duration)
+        generate_ass_subtitles(words, seg.punchline, ass_path, duration, accent_bgr=accent)
 
         nsfw_boxes = []
         if not args.no_nsfw_scan:
