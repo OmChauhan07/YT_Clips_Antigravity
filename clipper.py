@@ -29,6 +29,17 @@ FALLBACK_MODELS = [
 ]
 
 
+class NsfwRegion(BaseModel):
+    is_nsfw_present: bool = Field(description="Whether any nudity, exposed breasts, buttocks, or NSFW character parts are visible")
+    start_sec: float = Field(default=0.0, description="Start time in seconds of the NSFW content")
+    end_sec: float = Field(default=0.0, description="End time in seconds of the NSFW content")
+    ymin: int = Field(default=0, description="Normalized top coordinate 0-1000")
+    xmin: int = Field(default=0, description="Normalized left coordinate 0-1000")
+    ymax: int = Field(default=0, description="Normalized bottom coordinate 0-1000")
+    xmax: int = Field(default=0, description="Normalized right coordinate 0-1000")
+    description: str = Field(default="", description="Description of the censored area (e.g. character body part)")
+
+
 class ClipSegment(BaseModel):
     title: str = Field(description="Catchy Gen-Z YouTube Shorts / Reels title under 60 chars with emojis")
     punchline: str = Field(description="ALL-CAPS 4-8 word Gen-Z punchline banner e.g. BRO REALLY THOUGHT HE WAS HIM 💀")
@@ -283,6 +294,55 @@ def find_viral_clips(youtube_url: str, num_clips: int, model_name: str = "gemini
     return clips
 
 
+def scan_for_nsfw(raw_clip: Path, work_dir: Path, model_name: str = "gemini-3.5-flash-lite") -> list[dict]:
+    """
+    Scans video frames with Gemini Vision for nudity or NSFW character parts.
+    Returns list of normalized bounding boxes and time ranges if detected.
+    """
+    frames_dir = work_dir / f"nsfw_frames_{raw_clip.stem}"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(raw_clip),
+        "-vf", "fps=1/3",
+        str(frames_dir / "f_%03d.jpg"),
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    frame_files = sorted(list(frames_dir.glob("f_*.jpg")))
+    if not frame_files:
+        return []
+
+    print(f"  -> Scanning {len(frame_files)} frames for nudity / NSFW content via Gemini Vision...")
+    client = genai.Client(http_options={"api_version": "v1beta"})
+
+    contents = [
+        "Inspect these sample video frames from a livestream for any nudity, exposed breasts, buttocks, sensitive character body parts, or NSFW content that violates YouTube/Twitch TOS. "
+        "If any nudity or sensitive body area is found, set is_nsfw_present=true and return bounding box coordinates [ymin, xmin, ymax, xmax] (normalized 0-1000) and time range [start_sec, end_sec]. "
+        "If the video is safe and clean, set is_nsfw_present=false."
+    ]
+    for f in frame_files[:10]:
+        contents.append(types.Part.from_bytes(data=f.read_bytes(), mime_type="image/jpeg"))
+
+    try:
+        res = generate_with_fallback(
+            client=client,
+            contents=contents,
+            response_schema=NsfwRegion,
+            preferred_model=model_name,
+        )
+        data = json.loads(res.text)
+        if data.get("is_nsfw_present"):
+            print(f"    [NSFW Detected] {data.get('description', 'Sensitive area')} detected! Auto-blur box activated.")
+            return [data]
+        else:
+            print("    [NSFW Shield] Video scanned clean. No nudity or NSFW content detected.")
+            return []
+    except Exception as e:
+        print(f"    [NSFW Notice] Vision scan skipped ({e}).")
+        return []
+
+
 def download_slice(youtube_url: str, start_sec: float, end_sec: float, out_path: Path, browser: str | None = None):
     """
     Downloads high-bitrate VP9/AV1 1080p/4K streams using bv*[height<=2160]+ba/b.
@@ -352,12 +412,14 @@ def render_vertical_short(
     layout: str = "split",
     facecam_pos: str = "top-right",
     channel_watermark: str = "",
+    nsfw_boxes: list[dict] | None = None,
     crf: int = 17,
     preset: str = "slow",
 ):
     """
     Renders 1080x1920 vertical video with:
     - 3 layout modes: split | blur | zoom
+    - Automatic NSFW/nudity censorship blur box over sensitive body areas
     - Top-right channel watermark via drawtext
     - Lanczos scaling + unsharp sharpening (unsharp=5:5:0.6:5:5:0.0)
     - High-bitrate encoding: -crf 17, -preset slow, -pix_fmt yuv420p
@@ -378,7 +440,7 @@ def render_vertical_short(
     sub_filter = f"subtitles='{escaped_ass}'"
     sharpen_filter = "unsharp=5:5:0.6:5:5:0.0"
 
-    # Configure the selected 9:16 layout mode
+    # Configure the base 9:16 layout mode
     if layout == "split":
         # Streamer Split-Screen (Top: Facecam 1080x960, Bottom: Gameplay 1080x960)
         facecam_coords = {
@@ -389,26 +451,65 @@ def render_vertical_short(
         }
         cam_xy = facecam_coords.get(facecam_pos, "x=iw-ow:y=0")
 
-        filter_complex = (
+        base_complex = (
             f"[0:v]split=2[cam][game];"
             f"[cam]crop=w=ih*0.5*9/8:h=ih*0.5:{cam_xy},scale=1080:960:flags=lanczos[top];"
             f"[game]crop=w=ih*9/8:h=ih:x=(iw-ow)/2:y=(ih-oh)/2,scale=1080:960:flags=lanczos[bot];"
-            f"[top][bot]vstack=inputs=2,{sharpen_filter},{watermark_filter}{sub_filter}[outv]"
+            f"[top][bot]vstack=inputs=2,{sharpen_filter}"
         )
     elif layout == "blur":
         # Blurred Fill (16:9 centered over 1080x1920 Gaussian-blurred background)
-        filter_complex = (
+        base_complex = (
             f"[0:v]split=2[bg_in][fg_in];"
             f"[bg_in]crop=ih*9/16:ih:x=(iw-ow)/2:y=0,scale=1080:1920:flags=lanczos,gblur=sigma=30[bg];"
             f"[fg_in]scale=1080:-1:flags=lanczos[fg];"
-            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,{sharpen_filter},{watermark_filter}{sub_filter}[outv]"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,{sharpen_filter}"
         )
     else:
         # Zoomed In (Standard 9:16 center-crop)
-        filter_complex = (
+        base_complex = (
             f"[0:v]crop=ih*9/16:ih:x=(iw-ow)/2:y=(ih-oh)/2,"
-            f"scale=1080:1920:flags=lanczos,{sharpen_filter},{watermark_filter}{sub_filter}[outv]"
+            f"scale=1080:1920:flags=lanczos,{sharpen_filter}"
         )
+
+    # Apply automated NSFW blur box if any sensitive regions were detected
+    nsfw_filter = ""
+    if nsfw_boxes:
+        for b in nsfw_boxes:
+            if b.get("is_nsfw_present"):
+                t1 = max(0.0, float(b.get("start_sec", 0.0)))
+                t2 = min(3600.0, float(b.get("end_sec", 3600.0) or 3600.0))
+                if layout == "blur":
+                    bx = int(b.get("xmin", 0) * 1080 / 1000)
+                    bw = max(int((b.get("xmax", 1000) - b.get("xmin", 0)) * 1080 / 1000), 50)
+                    by = int(656 + b.get("ymin", 0) * 608 / 1000)
+                    bh = max(int((b.get("ymax", 1000) - b.get("ymin", 0)) * 608 / 1000), 50)
+                elif layout == "split":
+                    bx = int(b.get("xmin", 0) * 1080 / 1000)
+                    bw = max(int((b.get("xmax", 1000) - b.get("xmin", 0)) * 1080 / 1000), 50)
+                    by = int(960 + b.get("ymin", 0) * 960 / 1000)
+                    bh = max(int((b.get("ymax", 1000) - b.get("ymin", 0)) * 960 / 1000), 50)
+                else:
+                    bx = int(b.get("xmin", 0) * 1080 / 1000)
+                    bw = max(int((b.get("xmax", 1000) - b.get("xmin", 0)) * 1080 / 1000), 50)
+                    by = int(b.get("ymin", 0) * 1920 / 1000)
+                    bh = max(int((b.get("ymax", 1000) - b.get("ymin", 0)) * 1920 / 1000), 50)
+
+                bw = bw if bw % 2 == 0 else bw + 1
+                bh = bh if bh % 2 == 0 else bh + 1
+                bx = min(max(0, bx), 1080 - bw)
+                by = min(max(0, by), 1920 - bh)
+
+                nsfw_filter += (
+                    f"split[v_preblur][v_tospoil];"
+                    f"[v_tospoil]crop=w={bw}:h={bh}:x={bx}:y={by},boxblur=30:15[v_blurred];"
+                    f"[v_preblur][v_blurred]overlay={bx}:{by}:enable='between(t,{t1},{t2})'"
+                )
+
+    if nsfw_filter:
+        filter_complex = f"{base_complex}[v_layout];[v_layout]{nsfw_filter}[v_censored];[v_censored]{watermark_filter}{sub_filter}[outv]"
+    else:
+        filter_complex = f"{base_complex},{watermark_filter}{sub_filter}[outv]"
 
     cmd = [
         "ffmpeg", "-y",
@@ -477,6 +578,7 @@ def main():
     parser.add_argument("--gdrive-upload", action="store_true", default=cfg.get("gdrive_upload", False), help="Upload clips to Google Drive")
     parser.add_argument("--local-cleanup", action="store_true", default=cfg.get("local_cleanup", True), help="Clean temp_work after processing")
     parser.add_argument("--save-config", action="store_true", help="Save specified clip count and layout as new default in config.json")
+    parser.add_argument("--no-nsfw-scan", action="store_true", help="Skip vision-based NSFW censorship scan")
     args = parser.parse_args()
 
     if args.save_config:
@@ -529,6 +631,10 @@ def main():
 
         generate_ass_subtitles(words, seg.punchline, ass_path, duration)
 
+        nsfw_boxes = []
+        if not args.no_nsfw_scan:
+            nsfw_boxes = scan_for_nsfw(raw_path, work_dir, model_name=args.model)
+
         print(f"  -> Rendering 1080x1920 9:16 Short (Layout: {args.layout}, CRF: {cfg.get('crf', 17)})...")
         render_vertical_short(
             raw_clip=raw_path,
@@ -537,6 +643,7 @@ def main():
             layout=args.layout,
             facecam_pos=args.facecam,
             channel_watermark=watermark,
+            nsfw_boxes=nsfw_boxes,
             crf=cfg.get("crf", 17),
             preset=cfg.get("preset", "slow"),
         )
