@@ -1,0 +1,17 @@
+{
+  "default_clips": 3,
+  "default_layout": "split",
+  "default_facecam": "top-right",
+  "crf": 17,
+  "preset": "slow",
+  "models": [
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite"
+  ],
+  "gdrive_upload": false,
+  "gdrive_folder_id": "",
+  "local_cleanup": true,
+  "check_interval_seconds": 300
+}
